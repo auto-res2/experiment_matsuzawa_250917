@@ -6,5 +6,82 @@
     "rapid test-time training",
     "online adaptation acceleration",
     "meta test-time optimization"
+  ],
+  "research_study_list": [
+    {
+      "title": "TTT++: When Does Self-Supervised Test-Time Training Fail or Thrive?"
+    },
+    {
+      "title": "Persistent Test-time Adaptation in Recurring Testing Scenarios"
+    },
+    {
+      "title": "Active Test-Time Adaptation: Theoretical Analyses and An Algorithm"
+    },
+    {
+      "title": "Test Time Adaptation via Conjugate Pseudo-labels"
+    },
+    {
+      "title": "Improved Test-Time Adaptation for Domain Generalization"
+    },
+    {
+      "title": "Test Time Adaptation With Regularized Loss for Weakly Supervised Salient Object Detection"
+    },
+    {
+      "title": "Tent: Fully Test-Time Adaptation by Entropy Minimization"
+    },
+    {
+      "title": "What How and When Should Object Detectors Update in Continually Changing Test Domains?"
+    },
+    {
+      "title": "DELTA: DEGRADATION-FREE FULLY TEST-TIME ADAPTATION"
+    },
+    {
+      "title": "Test-Time Training with Self-Supervision for Generalization under Distribution Shifts"
+    },
+    {
+      "title": "Test-Time Training with Self-Supervision for Generalization under Distribution Shifts"
+    },
+    {
+      "title": "Speedy Performance Estimation for Neural Architecture Search"
+    },
+    {
+      "title": "Speedy Performance Estimation for Neural Architecture Search"
+    },
+    {
+      "title": "Multirate Training of Neural Networks"
+    },
+    {
+      "title": "Multirate Training of Neural Networks"
+    },
+    {
+      "title": "A simpler approach to accelerated optimization: iterative averaging meets optimism"
+    },
+    {
+      "title": "Evaluation of Test-Time Adaptation Under Computational Time Constraints"
+    },
+    {
+      "title": "A simple but strong baseline for online continual learning: Repeated Augmented Rehearsal"
+    },
+    {
+      "title": "Efficient Non-stationary Online Learning by Wavelets with Applications to Online Distribution Shift Adaptation"
+    },
+    {
+      "title": "Knowledge-Adaptation Priors"
+    },
+    {
+      "title": "Test Time Adaptation via Conjugate Pseudo-labels"
+    },
+    {
+      "title": "OST: Improving Generalization of DeepFake Detection via One-Shot Test-Time Training"
+    },
+    {
+      "title": "TinyTTA: Efficient Test-time Adaptation via Early-exit Ensembles on Edge Devices"
+    },
+    {
+      "title": "Harnessing Meta-Learning for Improving Full-Frame Video Stabilization"
+    },
+    {
+      "title": "M-L2O: Towards Generalizable Learning-to-Optimize by Test-Time Fast Self-Adaptation"
+    }
   ]
 }
