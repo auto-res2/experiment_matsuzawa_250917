@@ -567,7 +567,353 @@
     }
   ],
   "new_method": {
-    "method": "Open Problems: 1. Existing GAT accelerators either linearise attention with uncontrolled error or rely on stochastic neighbour sampling; none give per-node accuracy guarantees, mixed-precision memory savings, or handle million-edge hubs.\n2. Polynomial linearisation alone still stores bf16 / fp16 activations; memory traffic, not flops, limits throughput on A100/H100.\n3. Error tolerance depends on both node degree and task relevance (attention entropy, class margin). A finer control signal than degree is missing.\n4. Extreme hubs (d_v≫10 000) break shared-memory reductions even after linearisation; we need an asymptotically sub-linear strategy.\n5. Prior schemes offer no end-to-end guarantee that approximation + quantisation never alters the top-1 prediction on a trusted validation set.\nMethods: We propose HALO-GAT (Hierarchical, Adaptive, Low-precision, Orthogonal GAT) – an extension of DANCE-GAT.\nM1  Deterministic Piece-wise Chebyshev Map ϕ_m,c\n    • Split the (‖q‖‖k‖) range into C logarithmic bands; inside each band use a separate low-order Chebyshev expansion.  For typical graphs C=3 and max order m=4 suffice, cutting feature dim by ≈35 % versus single-range DANCE while preserving the same worst-case bound.\nM2  Task-Aware Budget Controller\n    • For every node v compute signal S_v = λ₁·H(α̂_v)+λ₂·margin_v where H is attention entropy from last epoch and margin_v is (logit_top−logit_second).  A 2-bit code produced by a tiny decision tree chooses one of four modes:\n         (E) exact soft-max,\n         (P) piece-wise Chebyshev, fp16,\n         (Q8) Chebyshev + INT8 activations,\n         (Q4) Chebyshev + INT4 activations.\n      The controller is re-evaluated every 5 epochs; switches are sticky to avoid oscillation.\nM3  Mixed-Precision Quantisation with Range Percentile Tracking\n    • We adapt Degree-Quant to message-passing: percentile-based range update runs once per mode; masks high-degree nodes against aggressive quantisation (they stay ≥Q8).  Quant kernels are fused with Chebyshev feature computation so values are never materialised in fp16.\nM4  Hierarchical Hub Decomposition\n    • For d_v>10 000 we cluster neighbours by a one-pass k-means++ (k=⌈√d_v⌉, features are static L2-normalised input embeddings).  Attention is computed exactly to the k centroids using mode decided by controller; inside each cluster cheap uniform weights are used.  This brings the per-hub cost to O(√d_v·m).\nM5  Self-Verified Training Curriculum\n    • At the end of each validation epoch we run exact fp32 attention on 1 000 sampled nodes per bucket and compute (a) max|α_exact−α_approx|, (b) sign consistency of top-1 neighbour.  If either exceeds thresholds (ε=0.03, ν=1 %), the controller bumps the precision/order for that bucket and replays the last mini-batch (takes <1 % extra time).\nM6  Orthogonal Balanced Init + Early Width-Drop (same as DANCE)\nExperimental Setup: Datasets  : ogbn-products, ogbn-arxiv, ogbn-papers100M (10 % subset), Reddit, PPI.\nModels    : GAT, Performer-GAT (64 RF), DANCE-GAT, HALO-GAT.\nLayers    : 6 and 10, hidden 128, 8 heads.\nMetrics   : accuracy/F1, wall-clock per epoch, peak GPU-mem, energy/epoch, average bit-width, fraction of nodes per mode, exact-vs-approx error, CO₂ (via code-carbon).\nRobustness: (i) ±20 % edge perturbation, (ii) insert synthetic super-hubs (d≈50k).\nHardware  : single H100-80 GB; INT4 kernels via NVIDIA sparsity+INT4 path; code also tested on RTX-4090.\nTraining  : AdamW lr 5e-3, 200 epochs, 3 seeds; progressive controller update every 5 epochs.\nExperimental Code: # pseudo-snippet for mixed Chebyshev + quant\nclass ChebQuantKernel(torch.autograd.Function):\n    @staticmethod\n    def forward(ctx, q, k, order, scale, zero_pt, bit_mode):\n        # q,k : [E,h,d]\n        # compute Chebyshev features up to order\n        gamma=(1/q.size(-1))**0.5\n        yq=gamma*q; yk=gamma*k\n        T0q,T1q=torch.ones_like(yq),yq\n        Tkq,Tkk=[T0q,T1q],[torch.ones_like(yk),yk]\n        for _ in range(2,order+1):\n            T2q=2*yq*T1q-T0q; Tkq.append(T2q); T0q,T1q=T1q,T2q\n            T2k=2*yk*Tkk[-1]-Tkk[-2]; Tkk.append(T2k)\n        phi_q=torch.cat(Tkq,dim=-1); phi_k=torch.cat(Tkk,dim=-1)\n        z=(phi_q*phi_k).sum(-1,keepdim=True)\n        if bit_mode!=16:\n            inv=1/scale; z.mul_(inv).add_(zero_pt).round_().clamp_(0,(1<<bit_mode)-1)\n            z.add_(-zero_pt).mul_(scale)\n        ctx.save_for_backward(phi_q,phi_k,z)\n        return z\n# Controller stub\nclass NodeMode(nn.Module):\n    def forward(self,entropy,margin,deg):\n        rule=(entropy>0.9)+(margin<0.2)+(deg>1024)\n        return {0:'Q4',1:'Q8',2:'P',3:'E'}[rule]\nExpected Result: • HALO-GAT matches vanilla GAT within ±0.15 % on all datasets, beats Performer by 0.6–1.0 %.\n• Epoch time: 5× faster than GAT, 1.6× faster than DANCE on ogbn-products; memory −62 % vs GAT (avg 9 GB vs 24 GB).\n• Average effective bit-width 7.3; 48 % nodes run Q4, 33 % Q8, 17 % P, 2 % Exact.\n• Energy/epoch −58 % vs DANCE, −70 % vs GAT; CO₂ over full training cut by 65 %.\n• Max |α_exact−α_approx| ≤0.028 and no top-1 flip on validation after epoch 30.\n• For synthetic super-hubs runtime scales empirically as O(√d) and accuracy drop <0.5 %.\n• Papers100M-10 % training completes in 11 h on one H100 (GAT: OOM, Performer: 26 h).\nExpected Conclusion: By unifying deterministic piece-wise polynomial linearisation with a task-aware precision controller, HALO-GAT delivers the first GAT that is simultaneously (a) sub-quadratic, (b) mixed-precision memory-efficient, and (c) equipped with a provable, self-verified error bound.  The hierarchical hub scheme further breaks the barrier for million-edge nodes, while the controller tailors computation to both graph structure and learning dynamics, yielding substantial speed-energy gains without sacrificing accuracy or reproducibility.  These results suggest that fine-grained, feedback-driven adaptation – rather than uniform heuristics – is key to scaling graph attention to web-scale workloads.  Future work will explore hardware-aware INT2 acceleration and extend the self-verification loop to temporal and heterogeneous graphs."
+    "method": "Open Problems: 1. Existing GAT accelerators either linearise attention with uncontrolled error or rely on stochastic neighbour sampling; none give per-node accuracy guarantees, mixed-precision memory savings, or handle million-edge hubs.\n2. Polynomial linearisation alone still stores bf16 / fp16 activations; memory traffic, not flops, limits throughput on A100/H100.\n3. Error tolerance depends on both node degree and task relevance (attention entropy, class margin). A finer control signal than degree is missing.\n4. Extreme hubs (d_v≫10 000) break shared-memory reductions even after linearisation; we need an asymptotically sub-linear strategy.\n5. Prior schemes offer no end-to-end guarantee that approximation + quantisation never alters the top-1 prediction on a trusted validation set.\nMethods: We propose HALO-GAT (Hierarchical, Adaptive, Low-precision, Orthogonal GAT) – an extension of DANCE-GAT.\nM1  Deterministic Piece-wise Chebyshev Map ϕ_m,c\n    • Split the (‖q‖‖k‖) range into C logarithmic bands; inside each band use a separate low-order Chebyshev expansion.  For typical graphs C=3 and max order m=4 suffice, cutting feature dim by ≈35 % versus single-range DANCE while preserving the same worst-case bound.\nM2  Task-Aware Budget Controller\n    • For every node v compute signal S_v = λ₁·H(α̂_v)+λ₂·margin_v where H is attention entropy from last epoch and margin_v is (logit_top−logit_second).  A 2-bit code produced by a tiny decision tree chooses one of four modes:\n         (E) exact soft-max,\n         (P) piece-wise Chebyshev, fp16,\n         (Q8) Chebyshev + INT8 activations,\n         (Q4) Chebyshev + INT4 activations.\n      The controller is re-evaluated every 5 epochs; switches are sticky to avoid oscillation.\nM3  Mixed-Precision Quantisation with Range Percentile Tracking\n    • We adapt Degree-Quant to message-passing: percentile-based range update runs once per mode; masks high-degree nodes against aggressive quantisation (they stay ≥Q8).  Quant kernels are fused with Chebyshev feature computation so values are never materialised in fp16.\nM4  Hierarchical Hub Decomposition\n    • For d_v>10 000 we cluster neighbours by a one-pass k-means++ (k=⌈√d_v⌉, features are static L2-normalised input embeddings).  Attention is computed exactly to the k centroids using mode decided by controller; inside each cluster cheap uniform weights are used.  This brings the per-hub cost to O(√d_v·m).\nM5  Self-Verified Training Curriculum\n    • At the end of each validation epoch we run exact fp32 attention on 1 000 sampled nodes per bucket and compute (a) max|α_exact−α_approx|, (b) sign consistency of top-1 neighbour.  If either exceeds thresholds (ε=0.03, ν=1 %), the controller bumps the precision/order for that bucket and replays the last mini-batch (takes <1 % extra time).\nM6  Orthogonal Balanced Init + Early Width-Drop (same as DANCE)\nExperimental Setup: Datasets  : ogbn-products, ogbn-arxiv, ogbn-papers100M (10 % subset), Reddit, PPI.\nModels    : GAT, Performer-GAT (64 RF), DANCE-GAT, HALO-GAT.\nLayers    : 6 and 10, hidden 128, 8 heads.\nMetrics   : accuracy/F1, wall-clock per epoch, peak GPU-mem, energy/epoch, average bit-width, fraction of nodes per mode, exact-vs-approx error, CO₂ (via code-carbon).\nRobustness: (i) ±20 % edge perturbation, (ii) insert synthetic super-hubs (d≈50k).\nHardware  : single H100-80 GB; INT4 kernels via NVIDIA sparsity+INT4 path; code also tested on RTX-4090.\nTraining  : AdamW lr 5e-3, 200 epochs, 3 seeds; progressive controller update every 5 epochs.\nExperimental Code: # pseudo-snippet for mixed Chebyshev + quant\nclass ChebQuantKernel(torch.autograd.Function):\n    @staticmethod\n    def forward(ctx, q, k, order, scale, zero_pt, bit_mode):\n        # q,k : [E,h,d]\n        # compute Chebyshev features up to order\n        gamma=(1/q.size(-1))**0.5\n        yq=gamma*q; yk=gamma*k\n        T0q,T1q=torch.ones_like(yq),yq\n        Tkq,Tkk=[T0q,T1q],[torch.ones_like(yk),yk]\n        for _ in range(2,order+1):\n            T2q=2*yq*T1q-T0q; Tkq.append(T2q); T0q,T1q=T1q,T2q\n            T2k=2*yk*Tkk[-1]-Tkk[-2]; Tkk.append(T2k)\n        phi_q=torch.cat(Tkq,dim=-1); phi_k=torch.cat(Tkk,dim=-1)\n        z=(phi_q*phi_k).sum(-1,keepdim=True)\n        if bit_mode!=16:\n            inv=1/scale; z.mul_(inv).add_(zero_pt).round_().clamp_(0,(1<<bit_mode)-1)\n            z.add_(-zero_pt).mul_(scale)\n        ctx.save_for_backward(phi_q,phi_k,z)\n        return z\n# Controller stub\nclass NodeMode(nn.Module):\n    def forward(self,entropy,margin,deg):\n        rule=(entropy>0.9)+(margin<0.2)+(deg>1024)\n        return {0:'Q4',1:'Q8',2:'P',3:'E'}[rule]\nExpected Result: • HALO-GAT matches vanilla GAT within ±0.15 % on all datasets, beats Performer by 0.6–1.0 %.\n• Epoch time: 5× faster than GAT, 1.6× faster than DANCE on ogbn-products; memory −62 % vs GAT (avg 9 GB vs 24 GB).\n• Average effective bit-width 7.3; 48 % nodes run Q4, 33 % Q8, 17 % P, 2 % Exact.\n• Energy/epoch −58 % vs DANCE, −70 % vs GAT; CO₂ over full training cut by 65 %.\n• Max |α_exact−α_approx| ≤0.028 and no top-1 flip on validation after epoch 30.\n• For synthetic super-hubs runtime scales empirically as O(√d) and accuracy drop <0.5 %.\n• Papers100M-10 % training completes in 11 h on one H100 (GAT: OOM, Performer: 26 h).\nExpected Conclusion: By unifying deterministic piece-wise polynomial linearisation with a task-aware precision controller, HALO-GAT delivers the first GAT that is simultaneously (a) sub-quadratic, (b) mixed-precision memory-efficient, and (c) equipped with a provable, self-verified error bound.  The hierarchical hub scheme further breaks the barrier for million-edge nodes, while the controller tailors computation to both graph structure and learning dynamics, yielding substantial speed-energy gains without sacrificing accuracy or reproducibility.  These results suggest that fine-grained, feedback-driven adaptation – rather than uniform heuristics – is key to scaling graph attention to web-scale workloads.  Future work will explore hardware-aware INT2 acceleration and extend the self-verification loop to temporal and heterogeneous graphs.",
+    "experimental_design": {
+      "experiment_strategy": "--------------------------------------------\nExperiment 1 – Full-Stack Throughput & Memory Benchmark\n--------------------------------------------\nGoal: Quantitatively show that HALO-GAT delivers higher speed and lower memory/energy than state-of-the-art GAT accelerators while maintaining task accuracy.\n\nSetup\n• Hardware: single A100-80 GB for 1-GPU runs; up to 8 × A100 for scalability sweep.\n• Datasets: ogbn-products, Reddit, ogbn-papers100M-10 %, + synthetic “SuperHub-1M” (1 M-edge node).\n• Models: (a) Vanilla GAT (fp32), (b) Performer-GAT (64 RF), (c) DANCE-GAT, (d) HALO-GAT.\n• Config: 6 layers, 8 heads, hidden 128; identical optimiser schedule; 200 epochs, 3 seeds.\n• Metrics per epoch: wall-clock time, GPU util, peak VRAM, DRAM traffic (Nsight), energy & CO₂ (code-carbon), accuracy/F1.\n\nProcedure\n1. Run all four models on each dataset on 1 × A100; log metrics.\n2. Repeat HALO-GAT on 1, 2, 4, 8 GPUs (DDP) to test linear scaling; measure speed-up and comms overhead.\n3. Record average bit-width, mode distribution, and Chebyshev order chosen by the controller every 5 epochs.\n\nExpected Demonstration\n• HALO-GAT matches GAT accuracy (≤0.2 % drop) but is ≥5× faster, uses ≤40 % memory, and cuts energy/epoch by ≥60 %.\n• Mixed-precision profile converges to ≈7-bit average; controller selects higher precision only for <3 % of nodes.\n• Near-linear throughput scaling to 8 × A100 confirms practicality for distributed training.\n\n--------------------------------------------\nExperiment 2 – Accuracy-Guarantee & Robustness Stress-Test\n--------------------------------------------\nGoal: Validate that self-verification (M5) reliably enforces the claimed per-node accuracy bound under graph perturbations and extreme hubs.\n\nSetup\n• Base graph: ogbn-products.\n• Perturbations: (i) ±20 % random edge rewiring, (ii) inject synthetic hubs with degrees 10 k, 50 k, 100 k.\n• Runs: HALO-GAT with self-verification ON vs. HALO-GAT with verification OFF vs. DANCE-GAT.\n• Metrics each validation epoch: max |α_exact − α_approx| over 1 000 sampled nodes, fraction of top-1 neighbour flips, overall accuracy.\n\nProcedure\n1. Train all variants for 200 epochs.\n2. After convergence, sweep ε ∈ {0.01, 0.02, 0.03, 0.05} to test tolerance of the bound mechanism.\n3. For hub degrees >10 k, profile runtime to confirm O(√d) behaviour.\n\nExpected Demonstration\n• With verification ON, max attention error never exceeds chosen ε and zero top-1 flips are observed; verification OFF occasionally violates the bound, causing up to 1 % accuracy loss.\n• Under rewiring or massive hubs, HALO-GAT accuracy degrades <0.5 % and runtime scales sub-linearly, whereas DANCE-GAT either slows dramatically or OOMs.\n• Confirms that the M5 loop plus hierarchical hubs (M4) jointly provide formal error safety and robustness.\n\n--------------------------------------------\nExperiment 3 – Ablation Study of Key Modules (M1-M5)\n--------------------------------------------\nGoal: Isolate the contribution of each novel component to speed, memory, and accuracy.\n\nSetup\n• Dataset: Reddit + ogbn-arxiv.\n• Variants: (A) full HALO-GAT, (B) −M1 (single-range Chebyshev), (C) −M2 (fixed fp16), (D) −M3 (no quant), (E) −M4 (no hub decomposition), (F) −M5 (no self-verification).\n• Metrics: accuracy/F1, time/epoch, VRAM, average bit-width, hub runtime, error bound violations.\n\nProcedure\n1. Train every variant for 150 epochs (3 seeds) on 1 × A100.\n2. Collect metrics and compute relative deltas to full HALO-GAT.\n3. Perform pairwise statistical tests (paired t-test) on final accuracy and runtime.\n\nExpected Demonstration\n• −M1: +12 % memory, −0.1 % accuracy → shows piece-wise Chebyshev’s memory benefit.\n• −M2/−M3: +70 % memory, +40 % time, same accuracy → highlights mixed-precision gains.\n• −M4: hub runtime ×6 on injected 50 k-degree node → validates sub-linear hub strategy.\n• −M5: occasional top-1 flips, 0.8 % accuracy drop → underscores necessity of self-verification.\n• Confirms that every module contributes materially, with M2+M3 offering the largest speed/memory win, M4 ensuring scalability, and M5 securing accuracy guarantees.\n",
+      "experiment_details": "============================================================\nGLOBAL SETTINGS (apply to all experiments unless overridden)\n============================================================\n1. Hardware & software\n   • 8 × NVIDIA A100-80 GB (PCIe), CUDA 12.2, cuDNN 8.9, PyTorch 2.1 + DDP.\n   • NCCL 2.18 for multi-GPU collectives, Nsight-Systems 2023.3 for kernel tracing, code-carbon 2.2 for energy / CO₂, PyRitual 0.4 for FLOPs counting.\n   • CPU: AMD EPYC 7763, 2 TB RAM, Ubuntu 22.04, Python 3.10.\n   • Mixed–precision path compiled with CUDA-WMMA INT4/8 (requires sm\u000090); fallback kernels are automatically loaded on older GPUs but are NOT used in the reported numbers (NO-FALLBACK).\n2. Common hyper-parameters\n   AdamW (β₁ = 0.9, β₂ = 0.999, weight-decay = 5 × 10⁻⁴), lr = 5 × 10⁻³ with cosine decay to 5 × 10⁻⁵, 200 epochs (unless shorter in ablation), batch-size = 131 072 edges (edge-parallel loader).  Gradient clipping ‖g‖₂ ≤ 5.\n   Seeds = {11, 23, 47}.  Where a single scalar is reported the mean over the three runs is shown; 95 % CI is included in brackets.  Model selection = best validation accuracy (primary metric) averaged over seeds.\n3. Dataset splits\n   • All OGB datasets use the official node-level train / valid / test masks (public-split).\n   • Reddit: 60 % train, 20 % val, 20 % test, stratified by class.\n   • SuperHub-1M: derived from the Reddit split – a duplicate of the training graph with one additional node that connects to 1 000 000 randomly chosen existing nodes; labels copied from the majority class of its neighbours.  The rest of the graph keeps the Reddit split.  This preserves a real graph distribution and therefore respects the NO-FALLBACK constraint.\n4. Data preprocessing (identical for all models)\n   a. Features: row-wise ℓ₂ normalisation, then optional PCA to 256 dims (only on PPI which has 50 × more features).  No PCA for other datasets.\n   b. Numeric precision: features stored as bf16 on disk; cast to fp16 at load time except for the vanilla fp32 GAT baseline.\n   c. Graph: remove self-loops, then add symmetrical edges (undirected) to satisfy attention symmetry; results cached in CSR.\n5. Evaluation metrics\n   Primary : Node-classification Accuracy (for multi-label PPI → micro-F1).\n   Secondary: (i) wall-clock sec / epoch, (ii) peak GPU-memory (GB), (iii) DRAM traffic (GB) via Nsight, (iv) energy (J) and CO₂ (g), (v) average effective bit-width, (vi) max‖α_exact−α_approx‖∞ and top-1 neighbour flip-rate (%).  Robustness specific metrics are introduced inside Exp-2.\n6. Resource accounting\n   • FLOPs counted once per forward + backward pass (training) and once per forward (inference).  Memory = peak reserved by CUDA allocator.  Time = arithmetic mean over epochs 51-150 (to skip I/O warm-up and late-stage variance).\n7. Hyper-parameter grids (only for sensitivity analysis)\n   lr ∈ {1e-2, 5e-3, 1e-3};  Chebyshev order m ∈ {3,4,5,6};  #bands C ∈ {1,2,3,4};  entropy weight λ₁ ∈ {0.3,0.5,0.7};  margin weight λ₂ ∈ {0.3,0.5,0.7}.  One-at-a-time sweep on ogbn-products.\n\n============================================================\nEXPERIMENT 1 – Full-Stack Throughput & Memory Benchmark\n============================================================\nObjective: Demonstrate that HALO-GAT meets or exceeds vanilla GAT accuracy while delivering superior speed, memory, and energy efficiency; verify scalability to 8 GPUs.\n\n1. Models under comparison\n   M-1  GAT-vanilla (fp32, soft-max) – PyG 2.4 implementation with fused attention.*\n   M-2  Performer-GAT (64 random features, fp16) – custom kernel adapted from Fast-Performer.  Uses redraw = 1000.\n   M-3  DANCE-GAT (Chebyshev order = 6, fp16) – authors’ code ported to PyTorch 2.1.\n   M-4  HALO-GAT (proposed) with modules M1–M6 enabled.\n   *Foot-note 1: For the fp32 baseline the dropout mask is kept in fp16 to equalise memory–access pattern; this does not affect numerical results.\n\n2. Datasets\n   ogbn-products, Reddit, ogbn-papers100M (10 % official subsample), SuperHub-1M (defined above).\n\n3. Splits – as in the global section.\n\n4. Run-plan\n   a. 1 GPU sweep: For every (dataset, model) tuple run 200 epochs × 3 seeds.  Log metrics every epoch; additional fine-grained CUDA profiling at epochs 20 & 100.\n   b. Multi-GPU scaling (HALO-GAT only): run with world-size = {1,2,4,8}.  Gradient synch every layer (DDP), graph partition via edge-cut METIS.  Measure speed-up = T₁ ⁄ T_w.\n   c. Controller telemetry: dump JSON every 5 epochs with (mode histogram, mean-bit, mean-order).\n\n5. Averaging & statistics\n   Accuracy: report mean ± 95 % CI.  Time/memory/energy: averaged across epochs 51-150; variation ≤1 %.\n\n6. Output expectations\n   • HALO-GAT ≤0.2 pp behind GAT accuracy on all datasets (CI overlap).  • ≥5× faster than GAT on products, ≥1.6× faster than DANCE.  • Peak VRAM ≤40 % of GAT.  • Energy/epoch ≤40 % of DANCE on every dataset.\n\n7. Example code stub (DDP launch)\n```\n$ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \\\n  --nproc_per_node=4 train.py \\\n  --model HALO --dataset ogbn-products \\\n  --layers 6 --hidden 128 --heads 8 \\\n  --controller_update 5 --epochs 200 --seed 11 \\\n  --log_json results/exp1.json\n```\n`train.py` internally selects the appropriate kernel:\n```python\nif args.model == 'HALO':\n    from halo_gat import HaloGAT\n    model = HaloGAT(..., cheb_bands=3, max_order=4,\n                    ctrl_lambda=(0.5,0.5), eps=0.03)\n```\n\n8. FLOPs / time calculation\n   Provided by helper:\n```python\nflops_train = FlopCounter(model, mode='train').count(graph)\nprint(f\"Train GFLOPs / epoch: {flops_train/1e9:.1f}\")\n```\n   Runtime cost is wall-clock × A100 hourly price (US$ 2.88).\n\n============================================================\nEXPERIMENT 2 – Accuracy-Guarantee & Robustness Stress-Test\n============================================================\nObjective: Verify that self-verification (M5) constrains the maximum attention error and prevents prediction flips under structural perturbations and extreme hubs.  Additionally, measure empirical O(√d) runtime on hubs.\n\n1. Models\n   V-1  HALO-GAT (verification ON, ε = 0.03).\n   V-2  HALO-GAT (verification OFF) – identical code path but skip Step-9 in Algorithm 1.\n   V-3  DANCE-GAT (baseline).\n\n2. Dataset & perturbations\n   Base graph : ogbn-products.\n   a. Edge-rewire: For r ∈ {-20 %, -10 %, +10 %, +20 %} randomly delete/insert undirected edges while keeping degree distribution.*\n   b. Hub-injection: attach new nodes with degrees d ∈ {10 k, 50 k, 100 k}.  Each hub inherits a random label.\n   *Foot-note 2: edges are rewired only within the training partition to avoid information leakage.\n\n3. Training schedule\n   200 epochs, 3 seeds.  For ε-sweep set ε ∈ {0.01,0.02,0.03,0.05} and rerun V-1.\n\n4. Additional robustness metrics\n   • Robust-Acc: accuracy on the perturbed test graph.\n   • Bound-violation-rate: % of sampled nodes where max‖α_exact−α_approx‖∞ > ε.\n   • Flip-rate: % nodes with different top-1 neighbour vs. exact fp32.\n   • Hub-runtime: mean forward time for the largest hub node.\n\n5. Procedure\n   Step-1  Train models on the original graph until epoch 200 (checkpoints every 10 epochs).\n   Step-2  Inject perturbations; resume from epoch-200 weights and fine-tune for 5 more epochs (to isolate inference vs. training effects).\n   Step-3  At each fine-tune epoch call `exact_attention_probe()` for 1 000 nodes per entropy bucket and log errors.\n   Step-4  Profile kernel runtime for hub nodes via CUDA events.\n\n6. Expected outcomes\n   • Verification ON keeps violation-rate ≤0.2 % (CI <0.1 %); OFF rises to 7–13 % depending on r.  • Robust-Acc drop ≤0.5 % for HALO (ON) vs. 1–2 % for DANCE.  • Hub forward time scales ∝√d (slope ≈ 0.0012 ms per √edge), confirming asymptotic claim.\n\n============================================================\nEXPERIMENT 3 – Ablation of Modules M1–M5\n============================================================\nObjective: Quantify the individual impact of each new component on accuracy, speed, and memory.\n\n1. Variants\n   A  Full HALO-GAT.\n   B  −M1: single-range Chebyshev (order = 6).\n   C  −M2: controller removed – fixed mode = P (fp16 + Chebyshev).\n   D  −M3: quantisation disabled – activations kept in fp16.\n   E  −M4: hub-decomposition disabled; compute full attention.\n   F  −M5: self-verification disabled.\n\n2. Datasets\n   Reddit (simpler) and ogbn-arxiv (medium scale) to reveal subtle accuracy impacts.\n\n3. Training details\n   150 epochs × 3 seeds, identical optimiser.\n\n4. Metrics\n   • Same primary & secondary as global.  • Additional: memory delta (ΔGB) and runtime delta (Δ%).  • Hub-runtime on a 50 k synthetic hub inserted into Reddit.\n\n5. Statistical analysis\n   For each metric compute paired t-test (N = 6 runs) against full HALO.  Significance threshold p < 0.05.\n\n6. Hyper-parameter sensitivity overlay\n   For the two most impactful modules (identified post-hoc) run a 3 × 3 grid over (m,C) and (λ₁,λ₂) on Reddit; report heat-maps in appendix.\n\n7. Expected results (numerical targets)\n   −M1: +11.8 % memory, −0.12 pp accuracy.\n   −M2: +30 % time, +52 % memory.\n   −M3: +12 % memory, +7 % time (due solely to fp16→INT8/4 removal).\n   −M4: hub node runtime ×6.3 (p < 1e-3).\n   −M5: flip-rate 0.7 % → 0 accuracy drop 0.8 pp.\n\n============================================================\nCROSS-EXPERIMENT UTILITIES\n============================================================\n1. Hyper-parameter analysis script\n```bash\npython sweep.py --model HALO --dataset ogbn-products \\\n  --grid \"lr=[1e-2,5e-3,1e-3];m=[3,4,5,6];C=[1,2,3]\"\n```\n   Automatically logs val-accuracy and resource metrics; results plotted via Seaborn violin-plots.\n\n2. Robustness harness\n```python\nfrom perturb import rewire_graph, inject_hub\nG_p = rewire_graph(G, percent=20)\nG_h = inject_hub(G, degree=50000)\n```\n\n3. FLOP & energy report generator\n```python\nreport = compile_report(log_dir)\nprint(report.to_markdown())\n```\n\n4. Memory debugging trick\n   Set `PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64` to force small chunks and catch fragmentation anomalies; applied to all runs to make memory numbers comparable.\n\n============================================================\nNOTES ON REPRODUCIBILITY\n============================================================\n• All random sources (Python, NumPy, PyTorch, METIS) are seeded.  • Each experiment logs git-commit hash and full conda env YAML.  • DDP uses `torch.distributed.broadcast_object_list` to propagate the seed so that every worker samples identical neighbour orders.\n\n============================================================\nDELIVERABLES\n============================================================\n• `exp1_results.csv`, `exp2_results.csv`, `exp3_results.csv` – per-epoch metrics.\n• `profile/*.nsys-rep` – Nsight traces for 4 representative epochs per model.\n• `plots/*.pdf` – accuracy curves, memory/time bar charts, robustness heat-maps.\n• `appendix_hyperparam.pdf` – sensitivity figures.\n• `README.md` – step-by-step commands to reproduce each table.\n",
+      "expected_models": [
+        "GAT-vanilla",
+        "Performer-GAT",
+        "DANCE-GAT",
+        "HALO-GAT"
+      ],
+      "expected_datasets": [
+        "ogbn-products",
+        "Reddit",
+        "ogbn-papers100M",
+        "ogbn-arxiv",
+        "PPI",
+        "SuperHub-1M"
+      ],
+      "external_resources": {
+        "hugging_face": {
+          "models": [],
+          "datasets": [
+            {
+              "id": "SauravMaheshkar/pareto-ogbn-arxiv",
+              "author": "SauravMaheshkar",
+              "sha": "0f3cb5bcb1c080f022f10940a9b134a11e6e0f2f",
+              "created_at": "2024-02-14T17:54:01+00:00",
+              "last_modified": "2024-02-14T17:57:14+00:00",
+              "private": false,
+              "gated": false,
+              "disabled": false,
+              "downloads": 39,
+              "likes": 0,
+              "siblings": [
+                {
+                  "rfilename": ".gitattributes"
+                },
+                {
+                  "rfilename": "README.md"
+                },
+                {
+                  "rfilename": "link_gen.py"
+                },
+                {
+                  "rfilename": "links/arxiv_tvtEdges.pkl"
+                },
+                {
+                  "rfilename": "pretrain_labels/metis_label_arxiv.pt"
+                }
+              ],
+              "card_data": {
+                "license": "cc",
+                "language": [],
+                "tags": [],
+                "datasets": [],
+                "task_categories": [
+                  "graph-ml"
+                ],
+                "size_categories": [
+                  "1K<n<10K"
+                ],
+                "metrics": [],
+                "widget": []
+              },
+              "tags": [
+                "task_categories:graph-ml",
+                "license:cc",
+                "size_categories:1K<n<10K",
+                "arxiv:2210.02016",
+                "region:us"
+              ],
+              "readme": "---\nsize_categories:\n- 1K<n<10K\ntask_categories:\n- graph-ml\nlicense: cc\n---\n\n## Dataset Information\n\n| # Nodes | # Edges | # Features |\n|:-------:|:---------:|:----------:|\n| 169,343 | 1,166,243 |     128    |\n\nPre-processed as per the official codebase of https://arxiv.org/abs/2210.02016\n\n## Citations\n\n```\n@article{ju2023multi,\n  title={Multi-task Self-supervised Graph Neural Networks Enable Stronger Task Generalization},\n  author={Ju, Mingxuan and Zhao, Tong and Wen, Qianlong and Yu, Wenhao and Shah, Neil and Ye, Yanfang and Zhang, Chuxu},\n  booktitle={International Conference on Learning Representations},\n  year={2023}\n}\n```",
+              "extracted_code": ""
+            },
+            {
+              "id": "macwiatrak/bacbench-ppi-stringdb-protein-sequences",
+              "author": "macwiatrak",
+              "sha": "58f79f84729fec6dea3100b0dbdc2bb70a22b6a0",
+              "created_at": "2025-04-17T15:20:40+00:00",
+              "last_modified": "2025-05-26T13:01:36+00:00",
+              "private": false,
+              "gated": false,
+              "disabled": false,
+              "downloads": 508,
+              "likes": 0,
+              "siblings": [
+                {
+                  "rfilename": ".gitattributes"
+                },
+                {
+                  "rfilename": "README.md"
+                },
+                {
+                  "rfilename": "data/test-00000-of-00020.parquet"
+                },
+                {
+                  "rfilename": "data/test-00001-of-00020.parquet"
+                },
+                {
+                  "rfilename": "data/test-00002-of-00020.parquet"
+                },
+                {
+                  "rfilename": "data/test-00003-of-00020.parquet"
+                },
+                {
+                  "rfilename": "data/test-00004-of-00020.parquet"
+                },
+                {
+                  "rfilename": "data/test-00005-of-00020.parquet"
+                },
+                {
+                  "rfilename": "data/test-00006-of-00020.parquet"
+                },
+                {
+                  "rfilename": "data/test-00007-of-00020.parquet"
+                }
+              ],
+              "card_data": {
+                "license": "apache-2.0",
+                "language": [],
+                "tags": [
+                  "ppi",
+                  "proteins",
+                  "biology",
+                  "bacteria",
+                  "stringdb"
+                ],
+                "datasets": [],
+                "task_categories": [],
+                "size_categories": [
+                  "10K<n<100K"
+                ],
+                "metrics": [],
+                "widget": []
+              },
+              "tags": [
+                "license:apache-2.0",
+                "size_categories:1K<n<10K",
+                "format:parquet",
+                "modality:tabular",
+                "modality:text",
+                "library:datasets",
+                "library:dask",
+                "library:mlcroissant",
+                "library:polars",
+                "region:us",
+                "ppi",
+                "proteins",
+                "biology",
+                "bacteria",
+                "stringdb"
+              ],
+              "readme": "---\nlicense: apache-2.0\ntags:\n- ppi\n- proteins\n- biology\n- bacteria\n- stringdb\npretty_name: Dataset for predicting protein-protein interactions in bacterial genomes\nsize_categories:\n- 10K<n<100K\n---\n# Dataset for protein-protein interaction prediction across bacteria (Protein sequences)\n\nA dataset of 10,533 bacterial genomes across 6,956 species with protein-protein interaction (PPI) scores for each genome.\n\nThe genome protein sequences and PPI scores have been extracted from [STRING DB](https://string-db.org/). \nEach row contains a set of protein sequences from a genome, ordered by their location on the chromosome and plasmids and a set of associated PPI scores.\nThe PPI scores have been extracted using the `combined` score from STRING DB. \n\n\nThe interaction between two proteins is represented by a triple: `[prot1_index, prot2_index, score]`. Where to get a probability score, you must divide the score by `1000` \n(i.e. if the score is `721` then to get a true score do `721/1000=0.721`). The index of a protein refers to the index of the protein in the `protein_sequences` column of the\nrow. See example below in [Usage](#usage)\n\n\n## Usage\nWe recommend loading the dataset in a streaming mode to prevent memory errors.\n```python\nfrom datasets import load_dataset\n\n\nds = load_dataset(\"macwiatrak/bacbench-ppi-stringdb-protein-sequences\", split=\"validation\", streaming=True)\nitem = next(iter(ds))\n\n# fetch protein sequences from a genome (list of strings)\nprot_seqs = item[\"protein_sequences\"]\n# fetch PPI triples labels (i.e. [prot1_index, prot2_index, score])\nppi_triples = item[\"triples_combined_score\"]\n\n# get protein seqs and label for one pair of proteins\nprot1 = prot_seqs[ppi_triples[0][0]]\nprot2 = prot_seqs[ppi_triples[0][1]]\nscore = ppi_triples[0][2] / 1000\n\n# we recommend binarizing the labels based on the threshold of 0.6\nbinary_ppi_triples = [\n  (prot1_index, prot2_index, int((score / 1000) >= 0.6)) for prot1_index, prot2_index, score in ppi_triples\n]\n```\n\n## Split\n\nWe provide `train`, `validation` and `test` splits with proportions of `70 / 10 / 20` (%) respectively as part of the dataset. The split was performed randomly at genome level.\n\nSee [github repository](https://github.com/macwiatrak/Bacbench) for details on how to embed the dataset with DNA and protein language models as well as code to predict antibiotic\nresistance from sequence.\n\n---\ndataset_info:\n  features:\n  - name: taxid\n    dtype: int64\n  - name: genome_name\n    dtype: string\n  - name: protein_sequences\n    sequence: string\n  - name: protein_ids\n    sequence: string\n  - name: triples_combined_score\n    sequence:\n      sequence: int64\n  - name: __index_level_0__\n    dtype: int64\n  splits:\n  - name: train\n    num_bytes: 169097180197\n    num_examples: 7354\n  - name: validation\n    num_bytes: 27541966357\n    num_examples: 1091\n  - name: test\n    num_bytes: 50704862883\n    num_examples: 2088\n  download_size: 53853247305\n  dataset_size: 247344009437\nconfigs:\n- config_name: default\n  data_files:\n  - split: train\n    path: data/train-*\n  - split: validation\n    path: data/validation-*\n  - split: test\n    path: data/test-*\n---",
+              "extracted_code": "from datasets import load_dataset\n\n\nds = load_dataset(\"macwiatrak/bacbench-ppi-stringdb-protein-sequences\", split=\"validation\", streaming=True)\nitem = next(iter(ds))\n\n# fetch protein sequences from a genome (list of strings)\nprot_seqs = item[\"protein_sequences\"]\n# fetch PPI triples labels (i.e. [prot1_index, prot2_index, score])\nppi_triples = item[\"triples_combined_score\"]\n\n# get protein seqs and label for one pair of proteins\nprot1 = prot_seqs[ppi_triples[0][0]]\nprot2 = prot_seqs[ppi_triples[0][1]]\nscore = ppi_triples[0][2] / 1000\n\n# we recommend binarizing the labels based on the threshold of 0.6\nbinary_ppi_triples = [\n  (prot1_index, prot2_index, int((score / 1000) >= 0.6)) for prot1_index, prot2_index, score in ppi_triples\n]"
+            },
+            {
+              "id": "Synthyra/bernett_gold_ppi",
+              "author": "Synthyra",
+              "sha": "bd0fed01f6699e3c1ebe1fd6542bb4f3a6640287",
+              "created_at": "2025-01-30T19:22:53+00:00",
+              "last_modified": "2025-02-07T18:12:31+00:00",
+              "private": false,
+              "gated": false,
+              "disabled": false,
+              "downloads": 168,
+              "likes": 0,
+              "siblings": [
+                {
+                  "rfilename": ".gitattributes"
+                },
+                {
+                  "rfilename": "README.md"
+                },
+                {
+                  "rfilename": "data/test-00000-of-00001.parquet"
+                },
+                {
+                  "rfilename": "data/train-00000-of-00001.parquet"
+                },
+                {
+                  "rfilename": "data/valid-00000-of-00001.parquet"
+                }
+              ],
+              "card_data": {
+                "language": [],
+                "tags": [],
+                "datasets": [],
+                "task_categories": [],
+                "size_categories": [],
+                "metrics": [],
+                "widget": []
+              },
+              "tags": [
+                "size_categories:100K<n<1M",
+                "format:parquet",
+                "modality:text",
+                "library:datasets",
+                "library:pandas",
+                "library:mlcroissant",
+                "library:polars",
+                "region:us"
+              ],
+              "readme": "---\ndataset_info:\n  features:\n  - name: A\n    dtype: string\n  - name: B\n    dtype: string\n  - name: labels\n    dtype: int8\n  - name: SeqA\n    dtype: string\n  - name: SeqB\n    dtype: string\n  splits:\n  - name: train\n    num_bytes: 271796192\n    num_examples: 163192\n  - name: valid\n    num_bytes: 73318294\n    num_examples: 59260\n  - name: test\n    num_bytes: 57573817\n    num_examples: 52048\n  download_size: 291089780\n  dataset_size: 402688303\nconfigs:\n- config_name: default\n  data_files:\n  - split: train\n    path: data/train-*\n  - split: valid\n    path: data/valid-*\n  - split: test\n    path: data/test-*\n---\n\n# Leakage-free \"gold\" standard PPI dataset\n\nFrom [Bernett, et al](https://figshare.com/articles/dataset/PPI_prediction_from_sequence_gold_standard_dataset/21591618), found in \n\nCracking the black box of deep sequence-based protein–protein interaction prediction\n* [paper](https://academic.oup.com/bib/article/25/2/bbae076/7621029)\n* [code](https://github.com/daisybio/data-leakage-ppi-prediction)\n\nand \n\nDeep learning models for unbiased sequence-based PPI prediction plateau at an accuracy of 0.65\n* [paper](https://www.biorxiv.org/content/10.1101/2025.01.23.634454v1)\n* [code](https://github.com/daisybio/PPI_prediction_study)\n\n## Description\nThis is a balanced binary protein-protein interaction dataset with positives from [HIPPIE](https://cbdm-01.zdv.uni-mainz.de/~mschaefer/hippie/) and paritioned with [KaHIP](https://kahip.github.io/). There are no sequence overlaps in splits, furthermore, they are split based on a maximum CD-HIT of 40% pairwise sequence similarity. Node degree bias was also reduced.\n\nNote:\n\n[Q96PU5](https://www.uniprot.org/uniprotkb/Q96PU5) is not located in the provided SwissProt fasta file but is used in the train split several times. We added this before data processing so no rows were dropped.\n\n## Example use\n```python\ndef get_ppi_data():\n    data = load_dataset(\"Synthyra/bernett_gold_ppi\").shuffle(seed=42)\n    data = data.remove_columns(['A', 'B'])\n    return data['train'], data['valid'], data['test']\n```\n\n## Please cite\nPlease cite their figshare dataset and papers if you use this dataset. \n",
+              "extracted_code": "def get_ppi_data():\n    data = load_dataset(\"Synthyra/bernett_gold_ppi\").shuffle(seed=42)\n    data = data.remove_columns(['A', 'B'])\n    return data['train'], data['valid'], data['test']"
+            },
+            {
+              "id": "viridono/CF-MS_Homo_sapiens_PPI",
+              "author": "viridono",
+              "sha": "cc3b57e5c2e3d8166597e3bf1fd202ae7d4288a5",
+              "created_at": "2024-11-22T17:01:01+00:00",
+              "last_modified": "2025-08-02T19:58:40+00:00",
+              "private": false,
+              "gated": false,
+              "disabled": false,
+              "downloads": 46,
+              "likes": 2,
+              "siblings": [
+                {
+                  "rfilename": ".gitattributes"
+                },
+                {
+                  "rfilename": "README.md"
+                },
+                {
+                  "rfilename": "build_cfms_local.py"
+                },
+                {
+                  "rfilename": "data/CB660_neural_stem_cell_IEX_Wan_2015.elut"
+                },
+                {
+                  "rfilename": "data/G166_glioma_stem_cell_IEX_Wan_2015_Hs_HCW_2.elut"
+                },
+                {
+                  "rfilename": "data/G166_glioma_stem_cell_IEX_Wan_2015_Hs_HCW_3.elut"
+                },
+                {
+                  "rfilename": "data/HEK_293_T_cells_SEC_Mallam_2019_C1.elut"
+                },
+                {
+                  "rfilename": "data/HEK_293_T_cells_SEC_Mallam_2019_C2.elut"
+                },
+                {
+                  "rfilename": "data/IEX_Wan_2015_Hs_HCW_4.elut"
+                },
+                {
+                  "rfilename": "data/IEX_Wan_2015_Hs_HCW_5.elut"
+                }
+              ],
+              "card_data": {
+                "language": [],
+                "tags": [
+                  "biology",
+                  "chemistry"
+                ],
+                "datasets": [],
+                "task_categories": [],
+                "size_categories": [
+                  "1M<n<10M"
+                ],
+                "metrics": [],
+                "widget": []
+              },
+              "tags": [
+                "size_categories:1M<n<10M",
+                "format:parquet",
+                "modality:text",
+                "library:datasets",
+                "library:dask",
+                "library:mlcroissant",
+                "library:polars",
+                "region:us",
+                "biology",
+                "chemistry"
+              ],
+              "readme": "---\nsize_categories:\n- 1M<n<10M\npretty_name: CF/MS Homo sapiens Elution Profile PPI Dataset\ntags:\n- biology\n- chemistry\ndataset_summary: Processed data from several *Homo sapiens* protein co-fractionation\n  mass spectrometry (CF/MS) experiments, as well as positive/negative protein-protein\n  interaction (PPI) labels for each pair. Collated, maintained by the Drew Lab at\n  University of Illinois at Chicago.\ncitation_bibtex:\n- '@article{Connelly2018, title = {Analysis of Human Nuclear Protein Complexes by\n  Quantitative Mass Spectrometry Profiling}, volume = {18}, ISSN = {1615-9861}, url\n  = {http://dx.doi.org/10.1002/pmic.201700427}, DOI = {10.1002/pmic.201700427}, number\n  = {11}, journal = {PROTEOMICS}, publisher = {Wiley}, author = {Connelly,  Katelyn\n  E. and Hedrick,  Victoria and Paschoal Sobreira,  Tiago Jose and Dykhuizen,  Emily\n  C. and Aryal,  Uma K.}, year = {2018}, month = may}'\n- '@article{Kirkwood2013, title = {Characterization of Native Protein Complexes and\n  Protein Isoform Variation Using Size-fractionation-based Quantitative Proteomics},\n  volume = {12}, ISSN = {1535-9476}, url = {http://dx.doi.org/10.1074/mcp.M113.032367},\n  DOI = {10.1074/mcp.m113.032367}, number = {12}, journal = {Molecular &amp; Cellular\n  Proteomics}, publisher = {Elsevier BV}, author = {Kirkwood,  Kathryn J. and Ahmad,  Yasmeen\n  and Larance,  Mark and Lamond,  Angus I.}, year = {2013}, month = dec, pages = {3851–3873}}'\n- '@article{Larance2016, title = {Global Membrane Protein Interactome Analysis using\n  In vivo Crosslinking and Mass Spectrometry-based Protein Correlation Profiling},\n  volume = {15}, ISSN = {1535-9476}, url = {http://dx.doi.org/10.1074/mcp.O115.055467},\n  DOI = {10.1074/mcp.o115.055467}, number = {7}, journal = {Molecular &amp; Cellular\n  Proteomics}, publisher = {Elsevier BV}, author = {Larance,  Mark and Kirkwood,  Kathryn\n  J. and Tinti,  Michele and Brenes Murillo,  Alejandro and Ferguson,  Michael A.J.\n  and Lamond,  Angus I.}, year = {2016}, month = jul, pages = {2476–2490}}'\n- '@article{Mallam2019, title = {Systematic Discovery of Endogenous Human Ribonucleoprotein\n  Complexes}, volume = {29}, ISSN = {2211-1247}, url = {http://dx.doi.org/10.1016/j.celrep.2019.09.060},\n  DOI = {10.1016/j.celrep.2019.09.060}, number = {5}, journal = {Cell Reports}, publisher\n  = {Elsevier BV}, author = {Mallam,  Anna L. and Sae-Lee,  Wisath and Schaub,  Jeffrey\n  M. and Tu,  Fan and Battenhouse,  Anna and Jang,  Yu Jin and Kim,  Jonghwan and\n  Wallingford,  John B. and Finkelstein,  Ilya J. and Marcotte,  Edward M. and Drew,  Kevin},\n  year = {2019}, month = oct, pages = {1351--1368.e5}}'\n- '@article{Moutaoufik2019, title = {Rewiring of the Human Mitochondrial Interactome\n  during Neuronal Reprogramming Reveals Regulators of the Respirasome and Neurogenesis},\n  volume = {19}, ISSN = {2589-0042}, url = {http://dx.doi.org/10.1016/j.isci.2019.08.057},\n  DOI = {10.1016/j.isci.2019.08.057}, journal = {iScience}, publisher = {Elsevier\n  BV}, author = {Moutaoufik,  Mohamed Taha and Malty,  Ramy and Amin,  Shahreen and\n  Zhang,  Qingzhou and Phanse,  Sadhna and Gagarinova,  Alla and Zilocchi,  Mara and\n  Hoell,  Larissa and Minic,  Zoran and Gagarinova,  Maria and Aoki,  Hiroyuki and\n  Stockwell,  Jocelyn and Jessulat,  Matthew and Goebels,  Florian and Broderick,  Kirsten\n  and Scott,  Nichollas E. and Vlasblom,  James and Musso,  Gabriel and Prasad,  Bhanu\n  and Lamantea,  Eleonora and Garavaglia,  Barbara and Rajput,  Alex and Murayama,  Kei\n  and Okazaki,  Yasushi and Foster,  Leonard J. and Bader,  Gary D. and Cayabyab,  Francisco\n  S. and Babu,  Mohan}, year = {2019}, month = sep, pages = {1114–1132}}'\n- '@article{Wan2015, title = {Panorama of ancient metazoan macromolecular complexes},\n  volume = {525}, ISSN = {1476-4687}, url = {http://dx.doi.org/10.1038/nature14877},\n  DOI = {10.1038/nature14877}, number = {7569}, journal = {Nature}, publisher = {Springer\n  Science and Business Media LLC}, author = {Wan,  Cuihong and Borgeson,  Blake and\n  Phanse,  Sadhna and Tu,  Fan and Drew,  Kevin and Clark,  Greg and Xiong,  Xuejian\n  and Kagan,  Olga and Kwan,  Julian and Bezginov,  Alexandr and Chessman,  Kyle and\n  Pal,  Swati and Cromar,  Graham and Papoulas,  Ophelia and Ni,  Zuyao and Boutz,  Daniel\n  R. and Stoilova,  Snejana and Havugimana,  Pierre C. and Guo,  Xinghua and Malty,  Ramy\n  H. and Sarov,  Mihail and Greenblatt,  Jack and Babu,  Mohan and Derry,  W. Brent\n  and R. Tillier,  Elisabeth and Wallingford,  John B. and Parkinson,  John and Marcotte,  Edward\n  M. and Emili,  Andrew}, year = {2015}, month = sep, pages = {339–344}}'\ncitation_apa:\n- Connelly, K. E., Hedrick, V., Paschoal Sobreira, T. J., Dykhuizen, E. C., & Aryal,\n  U. K. (2018). Analysis of Human Nuclear Protein Complexes by Quantitative Mass Spectrometry\n  Profiling. Proteomics, 18(11), e1700427. https://doi.org/10.1002/pmic.201700427\n- ? Kirkwood, K. J., Ahmad, Y., Larance, M., & Lamond, A. I. (2013). Characterization\n    of native protein complexes and protein isoform variation using size-fractionation-based\n    quantitative proteomics. Molecular & cellular proteomics\n  : MCP, 12(12), 3851–3873. https://doi.org/10.1074/mcp.M113.032367\n- ? Larance, M., Kirkwood, K. J., Tinti, M., Brenes Murillo, A., Ferguson, M. A.,\n    & Lamond, A. I. (2016). Global Membrane Protein Interactome Analysis using In\n    vivo Crosslinking and Mass Spectrometry-based Protein Correlation Profiling. Molecular\n    & cellular proteomics\n  : MCP, 15(7), 2476–2490. https://doi.org/10.1074/mcp.O115.055467\n- Mallam, A. L., Sae-Lee, W., Schaub, J. M., Tu, F., Battenhouse, A., Jang, Y. J.,\n  Kim, J., Wallingford, J. B., Finkelstein, I. J., Marcotte, E. M., & Drew, K. (2019).\n  Systematic Discovery of Endogenous Human Ribonucleoprotein Complexes. Cell reports,\n  29(5), 1351–1368.e5. https://doi.org/10.1016/j.celrep.2019.09.060\n- Moutaoufik, M. T., Malty, R., Amin, S., Zhang, Q., Phanse, S., Gagarinova, A., Zilocchi,\n  M., Hoell, L., Minic, Z., Gagarinova, M., Aoki, H., Stockwell, J., Jessulat, M.,\n  Goebels, F., Broderick, K., Scott, N. E., Vlasblom, J., Musso, G., Prasad, B., Lamantea,\n  E., … Babu, M. (2019). Rewiring of the Human Mitochondrial Interactome during Neuronal\n  Reprogramming Reveals Regulators of the Respirasome and Neurogenesis. iScience,\n  19, 1114–1132. https://doi.org/10.1016/j.isci.2019.08.057\n- Wan, C., Borgeson, B., Phanse, S., Tu, F., Drew, K., Clark, G., Xiong, X., Kagan,\n  O., Kwan, J., Bezginov, A., Chessman, K., Pal, S., Cromar, G., Papoulas, O., Ni,\n  Z., Boutz, D. R., Stoilova, S., Havugimana, P. C., Guo, X., Malty, R. H., … Emili,\n  A. (2015). Panorama of ancient metazoan macromolecular complexes. Nature, 525(7569),\n  339–344. https://doi.org/10.1038/nature14877\ndataset_info:\n- config_name: pairs\n  features:\n  - name: experiment_id\n    dtype: string\n  - name: uniprot_id1\n    dtype: string\n  - name: uniprot_id2\n    dtype: string\n  - name: elut_trace1\n    sequence: int32\n  - name: elut_trace2\n    sequence: int32\n  - name: label\n    dtype:\n      class_label:\n        names:\n          '0': neg\n          '1': pos\n  splits:\n  - name: train\n    num_bytes: 1412437731\n    num_examples: 2496144\n  - name: test\n    num_bytes: 1531716983\n    num_examples: 2769931\n  download_size: 262731062\n  dataset_size: 2944154714\n- config_name: proteins\n  features:\n  - name: experiment_id\n    dtype: string\n  - name: uniprot_id\n    dtype: string\n  - name: fraction_names\n    sequence: string\n  - name: trace\n    sequence: int32\n  splits:\n  - name: train\n    num_bytes: 25259541\n    num_examples: 20383\n  download_size: 683080\n  dataset_size: 25259541\nconfigs:\n- config_name: pairs\n  data_files:\n  - split: train\n    path: pairs/train-*\n  - split: test\n    path: pairs/test-*\n- config_name: proteins\n  data_files:\n  - split: train\n    path: proteins/train-*\n---\n\n# Quickstart Usage\n\nThis dataset can be loaded into python using the Huggingface [datasets](https://huggingface.co/docs/datasets/index) library. First, install the `datasets` library via command line:\n\n```\n$ pip install datasets\n```\n\nWith `datasets` installed, the user should then import it into their python script / environment:\n\n```\n>>> import datasets\n```\n\nThe user can then load the `CF-MS_Homo_sapiens_PPI` dataset using `datasets.load_dataset(...)`. There are two configurations, or 'views' for the set. The user can choose between them via the `name` parameter:\n\n* `pairs` (Default): Pairwise protein elution profiles with binary labels for whether the two proteins are known to interact\n\n  ```\n  >>> view = \"pairs\"\n  >>> dataset = datasets.load_dataset(\n    path = \"viridono/CF-MS_Homo_sapiens_PPI\",\n    name = view)\n  ```\n\n* `proteins`: Individual protein elution profiles without labels for if the user wishes to assemble in a non-pairwise fashion \n\n  ```\n  >>> view = \"proteins\"\n  >>> dataset = datasets.load_dataset(\n    path = \"viridono/CF-MS_Homo_sapiens_PPI\",\n    name = view)\n  ```\n\nand the dataset will be loaded as a `datasets.DatasetDict`. For pairs:\n```\n\n>>> dataset\nDatasetDict({\n    train: Dataset({\n        features: ['experiment_id', 'uniprot_id1', 'uniprot_id2', 'elut_trace1', 'elut_trace2', 'label'],\n        num_rows: 2496144\n    })\n    test: Dataset({\n        features: ['experiment_id', 'uniprot_id1', 'uniprot_id2', 'elut_trace1', 'elut_trace2', 'label'],\n        num_rows: 2769931\n    })\n})\n```\n\nand for proteins:\n\n```\nDatasetDict({\n    train: Dataset({\n        features: ['experiment_id', 'uniprot_id', 'fraction_names', 'trace'],\n        num_rows: 20383\n    })\n})\n```\n\nThis is a column-wise format. Elution traces are 1D vectors of protein abundances (PSMs) that are stored either in the `elut_trace#` column (for pairs) or in the `trace` (for individual proteins). Note that the traces have been uploaded in a lossless format, meaning they are not normalized across different experiments (`experiment_id`) (i.e. have differing lengths, differing peak heights).\n\nThe user may wish to normalize elution data when training. This is easily achievable following conversion to a `pandas.DataFrame`. Note that the `DatasetDict` must first be partitioned into its train and test splits:\n\n```\n>>> ds_train = dataset['train']\n>>> ds_test = dataset['test']\n>>> ds_train.to_pandas()\n>>> ds_test.to_pandas()\n```\n\n# Useful Pandas Normalizations / Transformations\n\nAs a `pandas.DataFrame`, the user can then apply any of various transformations, including padding the 1D vectors to make them of uniform length:\n\n```\nmax_len = max(df_train['elut_trace1'].apply(len))\ndf_train['elut_trace1'] = df_train['elut_trace1'].apply(lambda x: np.pad(x, (0, max_len - len(x)), mode='constant'))\n```\n\nor value-wise normalization, for example row-max:\n\n```\ndf_train['elut_trace1'] = df_train['elut_trace1'].apply(lambda x: x / x.max() if x.max() != 0 else x)\n```\n\nAlso note that elution data can be rather sparse, so the user might want to extract only the elution vectors that reach a certain minimum PSM threshold. **This should be done prior to value normalization**. Good values for minimum peak height are 5 or 10:\n\n```\ndf_filtered = df_train[df_train['elut_trace1'].apply(lambda x: np.any(x >= 10)) &\n                       df_train['elut_trace2'].apply(lambda x: np.any(x >= 10))]\n```\n\n# CF/MS Elution Profile PPI Dataset\n\nProteins are the functional basis of life, but it is often their interactions with other proteins which gives rise to said functions. Therefore, we are often interested in whether two proteins participate in the same *protein complex*, or if they **'co-complex'**. Co-fractionation mass spectrometry (CF/MS) is a high-throughput method for determining whether proteins form complexes. If they do, both proteins will typically separate out into the same fractions, or **'co-elute'**, during column chromatography experiments. As a result, their abundances will be *highly correlated* across all the fractions measured. CF/MS leverages this fact to identify new protein complexes by attempting to statistically correlate the elution profiles of groups of proteins. Typically, we use Pearson correlation coefficient to determine correlation between protein pairs. While this often works quite well, Pearson is a linear function. Current research is exploring whether there are non-linear, higher-order signals between these elution profiles that might have better predictive power than Pearson. As deep learning models excel at estimating non-linear relationships in data, the goal of this dataset is to act as training data for such models, especially **Siamese networks**.\n\nThis dataset includes processed data from several *Homo sapiens* protein **co-fractionation mass spectrometry (CF/MS)** experiments, as well as positive/negative protein-protein interaction (PPI) labels for each pair.\n\nCollated, maintained by **Drew Lab at University of Illinois at Chicago**\n\n[Drew Lab webpage](https://ksdrew.github.io/)\n\n## File formats\n- **The .elut file**: A **.elut** file is a TSV-like format containing raw count data from a chromatographic fractionation experiment. Each row in a **.elut** file shows the abundance of a single protein across the collected fractions (columns). Generally speaking, these fractions are collected over time. However, different chromatographic columns can separate proteins along different axes. For example, *Size-eclusion chromatography (SEC)* will mostly separate proteins into fractions according to their *size*; *Ion-exchange chromatography (IEX)* will separate them into fractions according to their *charge*. Each file in this dataset comes from one of these two column separation methods and is named accordingly ('...xx_SEC_xx...' / '...xx_IEX_xx...'). We refer to a given protein's (row's) count data across all fractions (columns) as that protein's elution trace or elution profile. To summarize:\n  - A given row contains count data for a specific protein \n  - A row's *first column* contains its associated **protein ID**\n  - A row's *subsequent columns* contain that protein's count data from the fractionation experiment\n  - **Note: The user may notice that the first row in a .elut file is one column longer than subsequent rows. This is because the first row contains row names (protein IDs), and the first column contains column names (fraction IDs). Therefore, cell 'A0' is empty.**\n\n## File structure\n- The **.elut** files each contain a collection elution traces for proteins from a given CF/MS experiment. These can be paired to make sample data. A complete list of data sources can be found at the bottom of this README\n- The **.txt** files contain line-wise specification of protein complexes used to generate positive/negative labels. These can be used to direct the pairing of elution traces into data points.\n  - **intact_complex_merge_20230309.train_ppis.txt**: List of positive PPIs for training data\n  - **intact_complex_merge_20230309.test_ppis.txt**: List of positive PPIs for testing data\n  - **intact_complex_merge_20230309.neg_train_ppis.txt**: List of negative PPIs for training data\n  - **intact_complex_merge_20230309.neg_test_ppis.txt**: List of negative PPIs for testing data\n  - **intact_complex_merge_20230309.train.txt** Line-wise list of protein complexes\n\n\n\n\n### List of publications/experiments from which this dataset was assembled:\n\nConnelly, K. E., Hedrick, V., Paschoal Sobreira, T. J., Dykhuizen, E. C., & Aryal, U. K. (2018). Analysis of Human Nuclear Protein Complexes by Quantitative Mass Spectrometry Profiling. Proteomics, 18(11), e1700427. https://doi.org/10.1002/pmic.201700427\n- T98G_glioblastoma_multiforme_cells_SEC_Conelly_2018_Bio1.elut\n- T98G_glioblastoma_multiforme_cells_SEC_Conelly_2018_Bio2.elut\n\nKirkwood, K. J., Ahmad, Y., Larance, M., & Lamond, A. I. (2013). Characterization of native protein complexes and protein isoform variation using size-fractionation-based quantitative proteomics. Molecular & cellular proteomics : MCP, 12(12), 3851–3873. https://doi.org/10.1074/mcp.M113.032367\n- U2OS_cells_SEC_Kirkwood_2013_rep1.elut\n- U2OS_cells_SEC_Kirkwood_2013_rep2.elut\n- U2OS_cells_SEC_Kirkwood_2013_rep3.elut\n\nLarance, M., Kirkwood, K. J., Tinti, M., Brenes Murillo, A., Ferguson, M. A., & Lamond, A. I. (2016). Global Membrane Protein Interactome Analysis using In vivo Crosslinking and Mass Spectrometry-based Protein Correlation Profiling. Molecular & cellular proteomics : MCP, 15(7), 2476–2490. https://doi.org/10.1074/mcp.O115.055467\n- U2OS_cells_SEC_Larance_2016_PT3281S1.elut\n- U2OS_cells_SEC_Larance_2016_PT3441S1.elut\n- U2OS_cells_SEC_Larance_2016_PT3442S1.elut\n- U2OS_cells_SEC_Larance_2016_PT3701S1.elut\n- U2OS_cells_SEC_Larance_2016_PTSS3801.elut\n- U2OS_cells_SEC_Larance_2016_PTSS3802.elut\n\nMallam, A. L., Sae-Lee, W., Schaub, J. M., Tu, F., Battenhouse, A., Jang, Y. J., Kim, J., Wallingford, J. B., Finkelstein, I. J., Marcotte, E. M., & Drew, K. (2019). Systematic Discovery of Endogenous Human Ribonucleoprotein Complexes. Cell reports, 29(5), 1351–1368.e5. https://doi.org/10.1016/j.celrep.2019.09.060\n- HEK_293_T_cells_SEC_Mallam_2019_C1.elut\n- HEK_293_T_cells_SEC_Mallam_2019_C2.elut\n\nMoutaoufik, M. T., Malty, R., Amin, S., Zhang, Q., Phanse, S., Gagarinova, A., Zilocchi, M., Hoell, L., Minic, Z., Gagarinova, M., Aoki, H., Stockwell, J., Jessulat, M., Goebels, F., Broderick, K., Scott, N. E., Vlasblom, J., Musso, G., Prasad, B., Lamantea, E., … Babu, M. (2019). Rewiring of the Human Mitochondrial Interactome during Neuronal Reprogramming Reveals Regulators of the Respirasome and Neurogenesis. iScience, 19, 1114–1132. https://doi.org/10.1016/j.isci.2019.08.057\n- NTera2_embryonal_carcinoma_stem_cells_IEX_Moutaoufik_2019_2_R1.elut\n- NTera2_embryonal_carcinoma_stem_cells_IEX_Moutaoufik_2019_2_R2.elut\n- NTera2_embryonal_carcinoma_stem_cells_IEX_Moutaoufik_2019_R1.elut\n- NTera2_embryonal_carcinoma_stem_cells_IEX_Moutaoufik_2019_R2.elut\n- NTera2_embryonal_carcinoma_stem_cells_SEC_Moutaoufik_2019_2_R1.elut\n- NTera2_embryonal_carcinoma_stem_cells_SEC_Moutaoufik_2019_2_R2.elut\n- NTera2_embryonal_carcinoma_stem_cells_SEC_Moutaoufik_2019_R1.elut\n- NTera2_embryonal_carcinoma_stem_cells_SEC_Moutaoufik_2019_R2.elut\n\nWan, C., Borgeson, B., Phanse, S., Tu, F., Drew, K., Clark, G., Xiong, X., Kagan, O., Kwan, J., Bezginov, A., Chessman, K., Pal, S., Cromar, G., Papoulas, O., Ni, Z., Boutz, D. R., Stoilova, S., Havugimana, P. C., Guo, X., Malty, R. H., … Emili, A. (2015). Panorama of ancient metazoan macromolecular complexes. Nature, 525(7569), 339–344. https://doi.org/10.1038/nature14877\n- CB660_neural_stem_cell_IEX_Wan_2015.elut\n- G166_glioma_stem_cell_IEX_Wan_2015_Hs_HCW_2.elut\n- G166_glioma_stem_cell_IEX_Wan_2015_Hs_HCW_3.elut\n- IEX_Wan_2015_Hs_HCW_4.elut\n- IEX_Wan_2015_Hs_HCW_5.elut\n- IEX_Wan_2015_Hs_HCW_6.elut\n- IEX_Wan_2015_Hs_HCW_7.elut\n- IEX_Wan_2015_Hs_HCW_8.elut\n- IEX_Wan_2015_Hs_HCW_9.elut\n- IEX_Wan_2015_Hs_IEX_1.elut\n- IEX_Wan_2015_Hs_IEX_2.elut",
+              "extracted_code": "import datasets\n\nview = \"pairs\"\ndataset = datasets.load_dataset(\n    path = \"viridono/CF-MS_Homo_sapiens_PPI\",\n    name = view)\n\nview = \"proteins\"\ndataset = datasets.load_dataset(\n    path = \"viridono/CF-MS_Homo_sapiens_PPI\",\n    name = view)\n\nds_train = dataset['train']\nds_test = dataset['test']\nds_train.to_pandas()\nds_test.to_pandas()\n\nmax_len = max(df_train['elut_trace1'].apply(len))\ndf_train['elut_trace1'] = df_train['elut_trace1'].apply(lambda x: np.pad(x, (0, max_len - len(x)), mode='constant'))\n\ndf_train['elut_trace1'] = df_train['elut_trace1'].apply(lambda x: x / x.max() if x.max() != 0 else x)\n\ndf_filtered = df_train[df_train['elut_trace1'].apply(lambda x: np.any(x >= 10)) &\n                       df_train['elut_trace2'].apply(lambda x: np.any(x >= 10))]"
+            },
+            {
+              "id": "vladak/string_ppi_human_5M",
+              "author": "vladak",
+              "sha": "23e2859a8b87a9a8c4526e3d059598b3199fa39d",
+              "created_at": "2025-08-06T22:17:32+00:00",
+              "last_modified": "2025-08-06T22:26:26+00:00",
+              "private": false,
+              "gated": false,
+              "disabled": false,
+              "downloads": 19,
+              "likes": 0,
+              "siblings": [
+                {
+                  "rfilename": ".gitattributes"
+                },
+                {
+                  "rfilename": "README.md"
+                },
+                {
+                  "rfilename": "data/test-00000-of-00002.parquet"
+                },
+                {
+                  "rfilename": "data/test-00001-of-00002.parquet"
+                },
+                {
+                  "rfilename": "data/train-00000-of-00010.parquet"
+                },
+                {
+                  "rfilename": "data/train-00001-of-00010.parquet"
+                },
+                {
+                  "rfilename": "data/train-00002-of-00010.parquet"
+                },
+                {
+                  "rfilename": "data/train-00003-of-00010.parquet"
+                },
+                {
+                  "rfilename": "data/train-00004-of-00010.parquet"
+                },
+                {
+                  "rfilename": "data/train-00005-of-00010.parquet"
+                }
+              ],
+              "card_data": {
+                "language": [],
+                "tags": [],
+                "datasets": [],
+                "task_categories": [],
+                "size_categories": [],
+                "metrics": [],
+                "widget": []
+              },
+              "tags": [
+                "size_categories:1M<n<10M",
+                "format:parquet",
+                "modality:tabular",
+                "modality:text",
+                "library:datasets",
+                "library:dask",
+                "library:mlcroissant",
+                "library:polars",
+                "region:us"
+              ],
+              "readme": "---\ndataset_info:\n  features:\n  - name: seq_name_a\n    dtype: string\n  - name: seq_name_b\n    dtype: string\n  - name: seq_a\n    dtype: string\n  - name: seq_b\n    dtype: string\n  - name: score\n    dtype: float64\n  - name: label\n    dtype: int64\n  splits:\n  - name: train\n    num_bytes: 4690401845\n    num_examples: 4000000\n  - name: validation\n    num_bytes: 586072769\n    num_examples: 500000\n  - name: test\n    num_bytes: 586418723\n    num_examples: 500000\n  download_size: 5523009997\n  dataset_size: 5862893337\nconfigs:\n- config_name: default\n  data_files:\n  - split: train\n    path: data/train-*\n  - split: validation\n    path: data/validation-*\n  - split: test\n    path: data/test-*\n---\n",
+              "extracted_code": ""
+            }
+          ]
+        }
+      }
+    }
   },
   "idea_info_history": [
     {
