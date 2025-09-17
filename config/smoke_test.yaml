@@ -1,0 +1,28 @@
+results_dir: .research/iteration1/smoke_test
+
+strategies:
+  strategy_1_energy_constrained:
+    defaults:
+      stream_length_steps: 100
+      batch_size: 16
+      optimizer:
+        lr: 1.0e-3
+      eager_params:
+        kalman:
+          process_noise: 1.0e-3
+          measurement_noise: 1.0e-3
+        gru_window: 8
+        hypernet:
+          rank: 8
+          mask_sparsity: 0.15
+      tta_steps: 1 # For baselines like Tent
+
+    experiments:
+      - model_name: resnet50
+        dataset: ImageNet-C
+        arrival_rate: 1.0
+        energy_budget: 1.10
+        baselines:
+          - EAGER-TTA
+          - Tent-5
+        random_seeds: [42]

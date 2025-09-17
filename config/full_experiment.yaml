@@ -1,0 +1,73 @@
+results_dir: .research/iteration1/full_experiment
+
+strategies:
+  strategy_1_energy_constrained:
+    defaults:
+      stream_length_steps: 2000
+      batch_size: 32
+      optimizer: {lr: 0.001}
+      eager_params:
+        kalman: {process_noise: 0.001, measurement_noise: 0.001}
+        gru_window: 8
+        hypernet: {rank: 8, mask_sparsity: 0.15}
+      tta_steps: 5
+
+    experiments:
+      - model_name: resnet50
+        dataset: ImageNet-C
+        arrival_rate: [1.0, 0.5, 0.25]
+        energy_budget: [1.05, 1.10, 1.25]
+        baselines: [EAGER-TTA, RePTA, GLaD, Tent-5, RoTTA, skip-2, skip-4]
+        random_seeds: [42, 123, 456, 789, 1011]
+      - model_name: vit-b-16
+        dataset: ImageNet-C
+        arrival_rate: [1.0, 0.5, 0.25]
+        energy_budget: [1.05, 1.10, 1.25]
+        baselines: [EAGER-TTA, RePTA, GLaD, Tent-5, RoTTA, skip-2, skip-4]
+        random_seeds: [42, 123, 456, 789, 1011]
+
+  strategy_2_long_horizon:
+    defaults:
+      stream_length_steps: 50000
+      batch_size: 64
+      optimizer: {lr: 0.001}
+      eager_params:
+        kalman: {process_noise: 0.001, measurement_noise: 0.001}
+        gru_window: 8
+        hypernet: {rank: 8, mask_sparsity: 0.15}
+      tta_steps: 1
+
+    experiments:
+      - model_name: convnext-tiny
+        dataset: RealStream-1M
+        baselines: [AdaBN, EATA, Tent-5, GLaD, EAGER-TTA]
+        random_seeds: [42, 123, 456]
+
+  strategy_3_cross_architecture:
+    defaults:
+      stream_length_steps: 10000 # Evaluate on a substantial stream
+      batch_size: 32
+      optimizer: {lr: 0.001}
+      eager_params:
+        kalman: {process_noise: 0.001, measurement_noise: 0.001}
+        gru_window: 8
+        hypernet: {rank: 8, mask_sparsity: 0.15}
+      tta_steps: 1
+
+    experiments:
+      - model_name: resnet50
+        dataset: ImageNet-C
+        baselines: [No-TTA, EAGER-TTA, GLaD, AdaBN/AdaLN-Tent, EAGER-TTA-NoMask]
+        random_seeds: [42, 123, 456]
+      - model_name: vit-b-16
+        dataset: ImageNet-C
+        baselines: [No-TTA, EAGER-TTA, GLaD, AdaBN/AdaLN-Tent, EAGER-TTA-NoMask]
+        random_seeds: [42, 123, 456]
+      - model_name: hubert-base
+        dataset: SpeechCommands-C
+        baselines: [No-TTA, EAGER-TTA, GLaD, AdaBN/AdaLN-Tent, EAGER-TTA-NoMask]
+        random_seeds: [42, 123, 456]
+      - model_name: convnext-tiny
+        dataset: Camelyon17-WILDS
+        baselines: [No-TTA, EAGER-TTA, GLaD, AdaBN/AdaLN-Tent, EAGER-TTA-NoMask]
+        random_seeds: [42, 123, 456]
