@@ -1,0 +1,79 @@
+globals:
+  epochs: 200
+  seeds: [11, 23, 47]
+  output_dir: ".research/iteration1"
+  gpus: [0]
+
+optimizer:
+  name: AdamW
+  lr: 0.005
+  weight_decay: 0.0005
+  betas: [0.9, 0.999]
+  scheduler_eta_min: 0.00005
+  grad_clip_norm: 5.0
+
+training:
+  batch_size: 131072 # Edges, will be translated to nodes in NeighborLoader
+
+# Common model structures
+base_model_config: &base_model_config
+  num_layers: 6
+  hidden_channels: 128
+  num_heads: 8
+
+experiment_1:
+  description: "Full-Stack Throughput & Memory Benchmark"
+  datasets: ["ogbn-products", "Reddit", "ogbn-arxiv"]
+  models:
+    - name: GAT
+      <<: *base_model_config
+    - name: PerformerGAT # Falls back to GAT in this implementation
+      <<: *base_model_config
+    - name: DANCEGAT # Falls back to GAT in this implementation
+      <<: *base_model_config
+    - name: HALOGAT
+      <<: *base_model_config
+
+experiment_2:
+  description: "Accuracy-Guarantee & Robustness Stress-Test"
+  # This experiment requires specific training runs with perturbations, which are not implemented here.
+  # The configuration is a placeholder to show the structure.
+  base_dataset: "ogbn-products"
+  datasets: ["ogbn-products-rewire-20", "ogbn-products-hub-50k"]
+  models:
+    - name: HALOGAT
+      <<: *base_model_config
+      self_verification: true
+      epsilon: 0.03
+    - name: HALOGAT
+      <<: *base_model_config
+      self_verification: false
+    - name: DANCEGAT
+      <<: *base_model_config
+
+experiment_3:
+  description: "Ablation Study of Key Modules (M1-M5)"
+  datasets: ["Reddit", "ogbn-arxiv"]
+  models:
+    - name: HALOGAT # Full model
+      <<: *base_model_config
+      ablation: 'none'
+    - name: HALOGAT # -M2, fixed P mode
+      <<: *base_model_config
+      ablation: 'no_controller'
+    - name: HALOGAT # -M3, no quant
+      <<: *base_model_config
+      ablation: 'no_quant'
+    - name: HALOGAT # -M5, no self-verify
+      <<: *base_model_config
+      ablation: 'no_verify'
+
+hyperparam_sensitivity:
+  description: "Sensitivity analysis of key hyperparameters"
+  dataset: "ogbn-products"
+  grids:
+    lr: [0.01, 0.005, 0.001]
+    chebyshev_order: [3, 4, 5, 6]
+    chebyshev_bands: [1, 2, 3, 4]
+    lambda1: [0.3, 0.5, 0.7]
+    lambda2: [0.3, 0.5, 0.7]

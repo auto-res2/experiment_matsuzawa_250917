@@ -1,0 +1,24 @@
+globals:
+  epochs: 2
+  seeds: [42]
+  output_dir: ".research/iteration1"
+  gpus: [0]
+
+optimizer:
+  name: AdamW
+  lr: 0.005
+  weight_decay: 0.0005
+  scheduler_eta_min: 0.00005
+  grad_clip_norm: 5.0
+
+training:
+  batch_size: 1024
+
+smoke_test_exp:
+  description: "A quick end-to-end test of the pipeline."
+  datasets: ["Cora"]
+  models:
+    - name: HALOGAT
+      num_layers: 2
+      hidden_channels: 16
+      num_heads: 2
